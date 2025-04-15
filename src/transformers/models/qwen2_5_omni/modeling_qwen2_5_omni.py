@@ -59,6 +59,7 @@ from .configuration_qwen2_5_omni import (
     Qwen2_5OmniToken2WavConfig,
     Qwen2_5OmniVisionEncoderConfig,
 )
+from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 
 
 if is_flash_attn_2_available():
@@ -1899,6 +1900,7 @@ QWEN2_5OMNI_START_DOCSTRING = r"""
 class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
     config_class = Qwen2_5OmniTextConfig
     _no_split_modules = ["Qwen2_5OmniDecoderLayer"]
+    supports_gradient_checkpointing = True
 
     def __init__(self, config: Qwen2_5OmniTextConfig):
         super().__init__(config)
@@ -1913,7 +1915,7 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2_5OmniRotaryEmbedding(config=config)
 
-        self.gradient_checkpointing = False
+        self.gradient_checkpointing = True
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -2315,6 +2317,37 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         self.rope_deltas = None
         self.post_init()
 
+    def ligre_loss_fn(self, hidden_states, labels, attention_mask):
+
+        # Shift so that tokens < n predict n
+        if attention_mask is not None and (attention_mask != 1).any():
+            shift_attention_mask = attention_mask[..., 1:]
+            shift_hidden = hidden_states[..., :-1, :][shift_attention_mask.to(hidden_states.device) != 0].contiguous()
+            shift_labels = labels[..., 1:][shift_attention_mask.to(labels.device) != 0].contiguous()
+        else:
+            shift_hidden = hidden_states[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
+        # fuses linear + cross entropy layers together and performs chunk-by-chunk computation to reduce memory
+        loss_fn = LigerFusedLinearCrossEntropyLoss(reduction='none')
+        # inputs = shift_hidden.reshape(-1, shift_hidden.size(-1))
+        # target = shift_labels.reshape(-1).to(inputs.device)
+        # loss = loss_fn(self.lm_head.weight, inputs, target)
+        # print(loss[:-100])
+
+        inputs = shift_hidden.view(-1, shift_hidden.size(-1))
+        target = shift_labels.view(-1).to(inputs.device)
+        loss = loss_fn(self.lm_head.weight, inputs, target)
+        print(loss[:-100])
+        # loss = loss_fn(self.lm_head.weight, inputs, target)
+        # print(loss)
+
+        weight = (target != -100)
+        weight = weight / weight.sum()
+        loss = (loss * weight).sum()
+
+        return loss
+
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
 
@@ -2348,6 +2381,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         use_audio_in_video: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         video_second_per_grid: Optional[torch.LongTensor] = None,
+        use_ligre = True,
+        **kwargs
     ) -> Union[Tuple, Qwen2_5OmniThinkerCausalLMOutputWithPast]:
         r"""
         Args:
@@ -2498,11 +2533,15 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         )
 
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
+        logits = self.lm_head(hidden_states) if not use_ligre else None
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size)
+            if not use_ligre:
+                num_items_in_batch = (labels!=-100).sum().item()
+                loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, num_items_in_batch=num_items_in_batch)
+            else:
+                loss = self.ligre_loss_fn(hidden_states, labels, attention_mask)
 
         if not return_dict:
             output = (logits,) + outputs
@@ -4381,6 +4420,7 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
 
         self.has_talker = config.enable_audio_output
         self.speaker_map = {}
+        print(f"{config.enable_audio_output=}")
         if config.enable_audio_output:
             self.enable_talker()
 
