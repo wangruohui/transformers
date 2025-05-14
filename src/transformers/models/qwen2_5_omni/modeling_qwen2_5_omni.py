@@ -60,7 +60,7 @@ from .configuration_qwen2_5_omni import (
     Qwen2_5OmniVisionEncoderConfig,
 )
 from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
-
+import peft
 
 if is_flash_attn_2_available():
     from flash_attn.flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func
@@ -2330,22 +2330,30 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             shift_labels = labels[..., 1:].contiguous()
 
         # fuses linear + cross entropy layers together and performs chunk-by-chunk computation to reduce memory
-        loss_fn = LigerFusedLinearCrossEntropyLoss(reduction='none')
+        loss_fn = LigerFusedLinearCrossEntropyLoss(reduction='sum')
         # inputs = shift_hidden.reshape(-1, shift_hidden.size(-1))
         # target = shift_labels.reshape(-1).to(inputs.device)
         # loss = loss_fn(self.lm_head.weight, inputs, target)
-        # print(loss[:-100])
+        # print(f"{loss[-60:]=}")
 
         inputs = shift_hidden.view(-1, shift_hidden.size(-1))
         target = shift_labels.view(-1).to(inputs.device)
-        loss = loss_fn(self.lm_head.weight, inputs, target)
-        print(loss[:-100])
+        if isinstance(self.lm_head, peft.tuners.lora.Linear):
+            lm_head_weight = self.lm_head.weight + self.lm_head.get_delta_weight('default')
+        else:
+            lm_head_weight = self.lm_head.weight
+        loss = loss_fn(lm_head_weight.to(inputs.dtype), inputs, target)
+        # loss = loss_fn(lm_head_weight, inputs, target)
+        # print(f"{loss[-60:]=}")
         # loss = loss_fn(self.lm_head.weight, inputs, target)
         # print(loss)
 
-        weight = (target != -100)
-        weight = weight / weight.sum()
-        loss = (loss * weight).sum()
+        # weight = (target != -100).sum()
+        # weight = weight / weight.sum()
+        # loss = (loss * weight).sum()
+
+        n_token = (target != -100).sum()
+        loss = loss / n_token
 
         return loss
 
@@ -2521,6 +2529,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
+        print(inputs_embeds.shape)
         outputs = self.model(
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -4421,7 +4430,7 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
 
         self.has_talker = config.enable_audio_output
         self.speaker_map = {}
-        print(f"{config.enable_audio_output=}")
+        # print(f"{config.enable_audio_output=}")
         if config.enable_audio_output:
             self.enable_talker()
 
